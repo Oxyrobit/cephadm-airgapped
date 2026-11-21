@@ -40,6 +40,7 @@ Seuls les dépôts de paquets restent nécessaires côté air-gap (miroir APT de
 ./ceph-images.py                 # images du bootstrap, une par ligne
 ./ceph-images.py --all           # toutes les images cephadm
 ./ceph-images.py --latest        # signale (stderr) les tags plus récents, non validés par cephadm
+./ceph-images.py --version 21.2.0  # images d'une version précise (cible d'upgrade)
 
 ./mirror.sh registry.local:5000 $(cat images.txt)
 ```
@@ -63,6 +64,7 @@ Seuls les dépôts de paquets restent nécessaires côté air-gap (miroir APT de
   | `CEPH_DOWNLOAD` | `https://download.ceph.com` |
   | `CEPH_RELEASE` | `auto` (dernière release ; ou `umbrella`, `tentacle`…) |
   | `CEPH_DISTRO` | `trixie` |
+  | `CEPH_VERSION` | vide (= dernière) ; équivaut à `--version` |
   | `GITHUB_RAW` | `https://raw.githubusercontent.com/ceph/ceph` (repli) |
 
 ### 2. Côté nœud air-gap
@@ -87,6 +89,47 @@ Le bootstrap affiche à la fin l'URL du dashboard, l'utilisateur et le mot de pa
    Le fichier `ceph/cephadm/images.py` qu'il contient fixe les versions des images de monitoring.
    Si le dépôt ne répond pas, le même fichier est lu sur GitHub, au tag correspondant.
 3. Chaque `image:tag` est vérifié sur son registre. Un tag introuvable donne un code retour ≠ 0.
+
+## Mettre à jour Ceph
+
+En air-gap, **la découverte des versions ne fonctionne pas, mais l'upgrade oui** :
+
+- `ceph orch upgrade ls` et la page *Upgrade* du dashboard interrogent le registre **directement
+  depuis le mgr, en HTTPS** (`https://quay.io/v2/ceph/ceph/tags/list`). Ces appels ne passent pas par
+  `registries.conf` et échouent :
+  `Cannot get tags from url 'https://quay.io/v2/ceph/ceph/tags/list' ... Name or service not known`.
+  C'est normal : la liste des versions vient de la machine connectée (`ceph-images.py`).
+- `ceph orch upgrade check|start` tirent l'image **via podman**, donc via le registre local.
+
+Le nouveau mgr redéploie aussi le monitoring avec **ses propres** versions d'images. Il faut donc
+copier les images de la **version cible**, pas seulement l'image `ceph`.
+
+```bash
+# 1. Machine connectée : images de la version cible -> registre local
+./ceph-images.py --version 21.2.1 > upgrade.txt     # ou sans --version pour la dernière
+./mirror.sh registry.local:5000 $(cat upgrade.txt)
+
+# 2. Nœuds air-gap (recommandé) : outils clients à la même version, depuis le miroir APT
+apt install --only-upgrade cephadm ceph-common
+
+# 3. Vérifier : tire l'image via le miroir et liste les démons concernés
+ceph orch upgrade check quay.io/ceph/ceph:v21.2.1
+
+# 4. Lancer et suivre
+ceph orch upgrade start --image quay.io/ceph/ceph:v21.2.1
+ceph orch upgrade status
+ceph -W cephadm
+```
+
+- **Image manquante pendant l'upgrade** : l'upgrade se met en pause (`manifest unknown` sur le
+  registre local). Copiez l'image manquante avec `mirror.sh`, puis `ceph orch upgrade resume`.
+- **Saut de version** : cephadm accepte au plus 2 releases majeures d'écart (ex. Squid → Umbrella).
+  Au-delà, passez par une release intermédiaire.
+- `ceph orch upgrade ls <registre-local>/quay.io/ceph/ceph` ne fonctionne qu'avec un registre local
+  en **HTTPS avec un certificat reconnu par le conteneur mgr**. Le mgr n'accepte pas le HTTP.
+- `--version` fonctionne de Reef (18.x) à aujourd'hui. Pour une version précise, la liste vient du
+  code source au tag correspondant sur GitHub (le dépôt APT ne contient que la dernière version de
+  chaque release).
 
 ## Bon à savoir
 

@@ -14,6 +14,7 @@ Usage :
     ./ceph-images.py              # images déployées par défaut au bootstrap
     ./ceph-images.py --all        # + toutes les images connues de cephadm
     ./ceph-images.py --latest     # signale (stderr) les tags plus récents disponibles
+    ./ceph-images.py --version 21.2.0   # images d'une version précise (cible d'upgrade)
     ./mirror.sh registry.local:5000 $(./ceph-images.py)
 """
 
@@ -38,6 +39,9 @@ GITHUB_RAW = "https://raw.githubusercontent.com/ceph/ceph"
 
 # Image Ceph principale
 CEPH_IMAGE = "quay.io/ceph/ceph"
+
+# Version imposée (vide = dernière). Équivaut à --version.
+CEPH_VERSION = ""
 
 HTTP_TIMEOUT = 30
 # =============================================================================
@@ -214,40 +218,76 @@ def images_py_from_deb(release):
 
 
 def images_py_from_github(version):
-    url = f"{GITHUB_RAW}/v{version}/src/python-common/ceph/cephadm/images.py"
-    log(f"# repli GitHub : {url}")
-    return get_bytes(url).decode()
+    """images.py (>= 20.x) ou, pour les versions plus anciennes, mgr/cephadm/module.py."""
+    for path in ("src/python-common/ceph/cephadm/images.py", "src/pybind/mgr/cephadm/module.py"):
+        url = f"{GITHUB_RAW}/v{version}/{path}"
+        try:
+            src = get_bytes(url).decode()
+        except urllib.error.HTTPError as e:
+            if e.code == 404:
+                continue
+            raise
+        if parse_images(src):
+            log(f"# source : {url}")
+            return src
+    raise RuntimeError(f"version v{version} introuvable sur {GITHUB_RAW} (tag inexistant ?)")
+
+
+# ancien format (<= 19.x) : DEFAULT_ALERT_MANAGER_IMAGE = '...'
+_LEGACY_KEYS = {"ALERT_MANAGER": "alertmanager"}
 
 
 def parse_images(src):
-    """{key: image_ref} depuis DefaultImages: _create_image('ref', 'key')"""
-    return {k: ref for ref, k in re.findall(r"_create_image\(\s*'([^']+)'\s*,\s*'([^']+)'", src)}
+    """{key: image_ref} depuis DefaultImages (_create_image('ref', 'key')) ou DEFAULT_*_IMAGE."""
+    imgs = {k: ref for ref, k in re.findall(r"_create_image\(\s*'([^']+)'\s*,\s*'([^']+)'", src)}
+    if not imgs:
+        for name, ref in re.findall(r"^DEFAULT_([A-Z0-9_]+)_IMAGE\s*=\s*'([^']+)'", src, re.M):
+            imgs[_LEGACY_KEYS.get(name, name.lower())] = ref
+    return imgs
 
 
 # ----------------------------------- main ------------------------------------
 def main():
-    args = set(sys.argv[1:])
-    if args - {"--all", "--latest", "-h", "--help"} or args & {"-h", "--help"}:
+    argv, args, target = sys.argv[1:], set(), os.environ.get("CEPH_VERSION", "")
+    while argv:
+        a = argv.pop(0)
+        if a == "--version" and argv:
+            target = argv.pop(0)
+        elif a.startswith("--version="):
+            target = a.split("=", 1)[1]
+        elif a in ("--all", "--latest", "-h", "--help"):
+            args.add(a)
+        else:
+            args.add("--bad")
+    if args & {"-h", "--help", "--bad"}:
         print(__doc__.strip(), file=sys.stderr)
-        return 0 if args & {"-h", "--help"} else 2
+        return 2 if "--bad" in args else 0
+    target = target.lstrip("v")
 
-    # 1. dernier tag stable de l'image Ceph sur le registre
-    reg, repo, _ = split_image(CEPH_IMAGE + ":x")
-    stable = [t for t in list_tags(reg, repo) if re.fullmatch(r"v\d+\.\d+\.\d+", t)]
-    latest_ceph = max(stable, key=version_key)
-    log(f"# dernier tag {CEPH_IMAGE} : {latest_ceph}")
+    if target:
+        # Version imposée (ex. cible d'un upgrade) : images.py au tag GitHub correspondant
+        if not re.fullmatch(r"\d+\.\d+\.\d+", target):
+            raise RuntimeError(f"version invalide : {target} (attendu X.Y.Z)")
+        log(f"# version demandée : v{target}")
+        version, src = target, images_py_from_github(target)
+    else:
+        # 1. dernier tag stable de l'image Ceph sur le registre
+        reg, repo, _ = split_image(CEPH_IMAGE + ":x")
+        stable = [t for t in list_tags(reg, repo) if re.fullmatch(r"v\d+\.\d+\.\d+", t)]
+        latest_ceph = max(stable, key=version_key)
+        log(f"# dernier tag {CEPH_IMAGE} : {latest_ceph}")
 
-    # 2. liste des images de cephadm correspondant
-    release = latest_release() if CEPH_RELEASE == "auto" else CEPH_RELEASE
-    try:
-        version, src = images_py_from_deb(release)
-    except Exception as e:  # dépôt injoignable -> GitHub
-        log(f"# dépôt Ceph indisponible ({e})")
-        version, src = latest_ceph.lstrip("v"), None
-        src = images_py_from_github(version)
-    if "v" + version != latest_ceph:
-        log(f"# NOTE : cephadm du dépôt '{release}' = {version}, registre = {latest_ceph} "
-            f"-> on suit cephadm (images testées avec cette version)")
+        # 2. liste des images de cephadm correspondant
+        release = latest_release() if CEPH_RELEASE == "auto" else CEPH_RELEASE
+        try:
+            version, src = images_py_from_deb(release)
+        except Exception as e:  # dépôt injoignable -> GitHub
+            log(f"# dépôt Ceph indisponible ({e})")
+            version = latest_ceph.lstrip("v")
+            src = images_py_from_github(version)
+        if "v" + version != latest_ceph:
+            log(f"# NOTE : cephadm du dépôt '{release}' = {version}, registre = {latest_ceph} "
+                f"-> on suit cephadm (images testées avec cette version)")
     defaults = parse_images(src)
     if not defaults:
         raise RuntimeError("aucune image trouvée dans images.py")
