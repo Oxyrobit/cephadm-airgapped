@@ -1,0 +1,54 @@
+name: update-images
+
+on:
+  schedule:
+    - cron: "17 5 * * *"   # tous les jours à 05:17 UTC
+  workflow_dispatch: {}
+  push:
+    branches: [main]
+    paths: [ceph-images.py, .github/workflows/update-images.yml]
+
+permissions:
+  contents: write
+
+concurrency:
+  group: update-images
+  cancel-in-progress: false
+
+jobs:
+  update:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Générer les listes d'images
+        run: |
+          ./ceph-images.py       > images.txt.new     2> log-default.txt || { cat log-default.txt; exit 1; }
+          ./ceph-images.py --all > images-all.txt.new 2> log-all.txt     || { cat log-all.txt; exit 1; }
+          cat log-all.txt
+          mv images.txt.new images.txt
+          mv images-all.txt.new images-all.txt
+          version=$(sed -n 's#^quay.io/ceph/ceph:##p' images.txt)
+          echo "CEPH_VERSION=$version" >> "$GITHUB_ENV"
+          {
+            echo "### Ceph $version"
+            echo '```'; cat images.txt; echo '```'
+            echo '<details><summary>Journal</summary>'; echo; echo '```'; cat log-all.txt; echo '```'; echo '</details>'
+          } >> "$GITHUB_STEP_SUMMARY"
+          rm -f log-*.txt
+
+      - name: Commit si changement
+        run: |
+          if git diff --quiet -- images.txt images-all.txt && git ls-files --error-unmatch images.txt images-all.txt >/dev/null 2>&1; then
+            echo "Aucun changement."
+            exit 0
+          fi
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add images.txt images-all.txt
+          git commit -m "images: mise à jour pour Ceph ${CEPH_VERSION}"
+          git push
