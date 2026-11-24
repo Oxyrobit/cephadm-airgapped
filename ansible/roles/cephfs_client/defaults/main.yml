@@ -1,14 +1,7 @@
-# --- Accès aux paquets ---------------------------------------------------------------
-apt_proxy: ""                                   # proxy HTTP pour apt/get_url (vide = aucun)
-debian_archive_releases: [bullseye]             # releases hors support -> archive.debian.org
-ceph_release: umbrella
-ceph_repo_url: "http://download.ceph.com/debian-{{ ceph_release }}"   # ou miroir local
-ceph_repo_key_url: "http://download.ceph.com/keys/release.asc"
-ceph_repo_codenames: [bookworm, trixie]         # codenames publiés ; sinon ceph-common de Debian
+# Prérequis : python3 et les dépôts Debian + Ceph (debian-<release>) déjà configurés sur la machine.
 
 # --- Cluster (délégation) ------------------------------------------------------------
 ceph_admin_host: ceph1                          # hôte inventaire avec client.admin
-ceph_allow_aes: false                           # autoriser le cipher cephx "aes" si un client l'exige
 
 # --- Filesystem ----------------------------------------------------------------------
 cephfs_name: ceph-main

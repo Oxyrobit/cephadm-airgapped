@@ -87,9 +87,11 @@ Le bootstrap affiche à la fin l'URL du dashboard, l'utilisateur et le mot de pa
 Le playbook [`ansible/cephfs-clients.yml`](ansible/cephfs-clients.yml) (rôle `cephfs_client`) prépare des
 clients Debian 11, 12 ou 13 vierges :
 
-1. **Dépendances** : `python3` (bootstrap en `raw`), dépôt `debian-<release>` de Ceph pour bookworm et trixie
-   (`ceph-common` de Debian sinon), `kmod`, module `ceph`. Le proxy apt est optionnel (`apt_proxy`).
-   bullseye, hors support, passe par `archive.debian.org`.
+**Prérequis** sur les clients : `python3`, et des dépôts Debian et Ceph (`debian-<release>`) déjà configurés
+et joignables. Le rôle ne touche ni aux sources apt ni au proxy.
+
+1. **Paquet** : `ceph-common` (fournit `mount.ceph`). Le module noyau `ceph` est chargé automatiquement par
+   le noyau au premier `mount -t ceph`.
 2. **Clé dédiée par hôte**, générée sur le cluster par `delegate_to: ceph_admin_host` : `client.<hostname>`,
    droits limités au subvolume.
    - `mon 'allow r fsname=<fs>'`
@@ -100,6 +102,8 @@ clients Debian 11, 12 ou 13 vierges :
 3. **Type de clé selon le noyau du client** : `aes` si le noyau est antérieur à 7.0, `aes256k` sinon.
    - Le seuil se règle avec `cephfs_aes256k_min_kernel`.
    - Une clé existante d'un autre type est convertie par `ceph auth rotate`.
+   - **Le rôle ne modifie jamais les réglages du cluster.** Si une clé `aes` est nécessaire et que le cluster
+     ne l'accepte pas, il s'arrête et affiche les commandes à lancer (voir plus bas).
 4. **`/etc/ceph/ceph.conf`** contient seulement le `fsid` et `mon_dns_srv_name` : les monitors sont trouvés
    par **DNS SRV**. La clé est déposée dans `/etc/ceph/ceph.client.<hostname>.keyring` (0600).
 5. **fstab** : `_netdev,x-systemd.automount`. Le montage se fait **après le réseau, au premier accès**.
@@ -107,14 +111,13 @@ clients Debian 11, 12 ou 13 vierges :
 ```bash
 cd ansible
 cp inventory.example.yml inventory.yml   # adapter : hôtes, apt_proxy, ceph_admin_host
-ansible-galaxy collection install community.general ansible.posix
+ansible-galaxy collection install ansible.posix
 ansible-playbook cephfs-clients.yml
 ```
 
 | Variable | Défaut | Rôle |
 |---|---|---|
 | `ceph_admin_host` | `ceph1` | hôte de l'inventaire qui possède `client.admin` |
-| `ceph_allow_aes` | `false` | autoriser le cipher `aes` sur le cluster si un client l'exige |
 | `cephfs_name` / `cephfs_subvolume_group` / `cephfs_subvolume` | `ceph-main` / `main` / `nfs` | cible ; créée si absente (`cephfs_subvolume_create`) |
 | `cephfs_mountpoint` | `/mnt/nfs-main` | point de montage |
 | `cephfs_access` | `rw` | `rw` ou `r` |
@@ -122,7 +125,6 @@ ansible-playbook cephfs-clients.yml
 | `cephfs_key_type` | calculé | forcer `aes` ou `aes256k` pour un hôte |
 | `cephfs_mon_dns_srv_name` | `ceph-mon` | nom du SRV ; `cephfs_mon_host` désactive le SRV |
 | `cephfs_ms_mode` / `cephfs_mon_addr` | vide | chiffrement sur le fil (voir plus bas) |
-| `ceph_repo_url`, `ceph_repo_key_url`, `apt_proxy` | download.ceph.com, vide | miroirs et proxy |
 
 ### Enregistrement SRV
 
@@ -151,19 +153,17 @@ Depuis Umbrella, le cluster n'accepte que `aes256k`. Or le client noyau Linux 6.
 - côté noyau : `libceph: secret too big 32` ;
 - côté mount.ceph : `adding ceph secret key to kernel failed: Invalid argument`.
 
-Avec `ceph_allow_aes: true`, le rôle fait ces étapes lui-même. Sinon, à la main sur le cluster :
+Ces étapes sont **manuelles**, à faire par l'administrateur du cluster. Le rôle vérifie seulement qu'elles
+ont été faites, et rappelle de refermer l'étape 2 si elle est restée ouverte.
 
 ```bash
 # 1. accepter aes en plus d'aes256k pour l'authentification
 ceph mon set auth_allowed_ciphers aes,aes256k
 ceph mon dump | grep cipher                     # auth_allowed_ciphers aes, aes256k
 
-# 2. autoriser la création de clés aes le temps de créer ou convertir les clés
+# 2. autoriser la création de clés aes, lancer le playbook, puis refermer
 ceph config set mon mon_auth_allow_insecure_key true
-ceph auth get-or-create client.app1 mon 'allow r fsname=ceph-main' \
-  mds 'allow rw fsname=ceph-main path=/volumes/main/nfs/<uuid>' \
-  osd 'allow rw pool=cephfs.ceph-main.data namespace=fsvolumens__main_nfs' --key_type aes
-ceph auth rotate client.app2 --key_type aes      # convertir une clé existante
+ansible-playbook cephfs-clients.yml              # crée ou convertit les clés aes
 ceph config set mon mon_auth_allow_insecure_key false
 
 # 3. contrôle : AUTH_INSECURE_CLIENT_KEY_TYPE et AUTH_INSECURE_KEYS_ALLOWED sont attendus

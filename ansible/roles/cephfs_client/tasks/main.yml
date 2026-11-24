@@ -8,65 +8,19 @@
     fail_msg: "Debian uniquement ; cephfs_ms_mode exige cephfs_mon_addr (le helper ne lit pas d'adresse msgr2 depuis le SRV)."
 
 # ------------------------------------------------------------------------------------
-# 1. Dépendances (miroirs Debian / Ceph, via proxy éventuel)
+# 1. Paquet (dépôts Debian et Ceph déjà configurés et joignables sur la machine)
 # ------------------------------------------------------------------------------------
-- name: Proxy apt
-  ansible.builtin.copy:
-    dest: /etc/apt/apt.conf.d/90proxy
-    content: 'Acquire::http::Proxy "{{ apt_proxy }}";'
-    mode: "0644"
-  when: apt_proxy | length > 0
-
-- name: Release hors support -> archive.debian.org
-  ansible.builtin.copy:
-    dest: /etc/apt/sources.list
-    content: |
-      deb http://archive.debian.org/debian {{ ansible_distribution_release }} main
-      deb http://archive.debian.org/debian-security {{ ansible_distribution_release }}-security main
-    mode: "0644"
-  when: ansible_distribution_release in debian_archive_releases
-
-- name: Dépôt Ceph ({{ ceph_release }})
-  when: ansible_distribution_release in ceph_repo_codenames
-  block:
-    - name: Clé de signature Ceph
-      ansible.builtin.get_url:
-        url: "{{ ceph_repo_key_url }}"
-        dest: /etc/apt/keyrings/ceph.asc
-        mode: "0644"
-      register: cephfs_repo_key
-      environment: "{{ {'http_proxy': apt_proxy, 'https_proxy': apt_proxy} if apt_proxy else {} }}"
-
-    - name: Source apt Ceph
-      ansible.builtin.copy:
-        dest: /etc/apt/sources.list.d/ceph.sources
-        mode: "0644"
-        content: |
-          Types: deb
-          URIs: {{ ceph_repo_url }}
-          Suites: {{ ansible_distribution_release }}
-          Components: main
-          Signed-By: /etc/apt/keyrings/ceph.asc
-      register: cephfs_repo_src
-
-# dépôt ajouté/modifié : relire le cache et passer à la version Ceph du dépôt (sinon apt garde celle de Debian)
-- name: Paquets (ceph-common fournit mount.ceph)
+- name: ceph-common (fournit mount.ceph)
   ansible.builtin.apt:
-    name: [ceph-common, kmod]
-    state: "{{ 'latest' if (cephfs_repo_src is changed or cephfs_repo_key is changed) else 'present' }}"
+    name: ceph-common
     install_recommends: false
     update_cache: true
-    cache_valid_time: "{{ 0 if (cephfs_repo_src is changed or cephfs_repo_key is changed) else 3600 }}"
+    cache_valid_time: 3600
 
 - name: Version de ceph-common
   ansible.builtin.command: ceph --version
   register: cephfs_ceph_version
   changed_when: false
-
-- name: Module noyau ceph
-  community.general.modprobe:
-    name: ceph
-    persistent: present
 
 # ------------------------------------------------------------------------------------
 # 2. Côté cluster (delegate_to) : subvolume, clé dédiée, caps
@@ -106,6 +60,11 @@
       register: cephfs_monmap
       changed_when: false
 
+    - name: Création de clés aes autorisée ?
+      ansible.builtin.command: ceph config get mon mon_auth_allow_insecure_key
+      register: cephfs_insecure_key
+      changed_when: false
+
 - name: Faits du subvolume
   ansible.builtin.set_fact:
     cephfs_fsid: "{{ cephfs_fsid_cmd.stdout | trim }}"
@@ -121,6 +80,7 @@
         allow {{ cephfs_access }} tag cephfs data={{ cephfs_name }}
         {%- endif -%}
     cephfs_allowed_ciphers: "{{ (cephfs_monmap.stdout | from_json).auth_allowed_ciphers | map(attribute='name') | list }}"
+    cephfs_insecure_key_allowed: "{{ cephfs_insecure_key.stdout | trim | bool }}"
 
 - name: Clé existante
   ansible.builtin.command: ceph auth get client.{{ cephfs_client_name }} -f json
@@ -132,60 +92,40 @@
 # Le type est encodé dans les 2 premiers octets de la clé : 1 = aes ("AQ..."), 2 = aes256k ("Ag...").
 - name: Action à mener sur la clé
   ansible.builtin.set_fact:
-    cephfs_key_type_fact: "{{ cephfs_key_type }}"    # fait d'hôte, lisible via hostvars
     cephfs_key_action: >-
       {%- if cephfs_auth_get.rc != 0 -%}create
       {%- elif ((cephfs_auth_get.stdout | from_json)[0].key[:2] == 'AQ') != (cephfs_key_type == 'aes') -%}rotate
       {%- else -%}none{%- endif -%}
 
-- name: Le cluster doit accepter le cipher aes
+# Le cluster n'est jamais modifié par le rôle : l'ouverture d'aes est une action manuelle de l'administrateur.
+- name: Le cluster doit accepter les clés aes
   ansible.builtin.assert:
-    that: "'aes' in cephfs_allowed_ciphers or ceph_allow_aes | bool"
+    that:
+      - "'aes' in cephfs_allowed_ciphers"
+      - cephfs_key_action == 'none' or cephfs_insecure_key_allowed
     fail_msg: >-
-      {{ inventory_hostname }} (noyau {{ ansible_kernel }}) exige une clé "aes" mais le cluster n'autorise que
-      {{ cephfs_allowed_ciphers }}. Passez ceph_allow_aes=true ou lancez sur le cluster :
-      ceph mon set auth_allowed_ciphers aes,aes256k
+      {{ inventory_hostname }} (noyau {{ ansible_kernel }}) exige une clé "aes" ({{ cephfs_key_action }}).
+      Ciphers autorisés : {{ cephfs_allowed_ciphers }} ; mon_auth_allow_insecure_key = {{ cephfs_insecure_key_allowed }}.
+      À faire par l'administrateur sur le cluster :
+      ceph mon set auth_allowed_ciphers aes,aes256k ;
+      ceph config set mon mon_auth_allow_insecure_key true ;
+      relancer le playbook, puis : ceph config set mon mon_auth_allow_insecure_key false
   when: cephfs_key_type == 'aes'
 
-- name: Créer / convertir les clés
-  vars:
-    cephfs_need_insecure: >-
-      {{ ansible_play_hosts | map('extract', hostvars)
-         | selectattr('cephfs_key_type_fact', 'equalto', 'aes')
-         | rejectattr('cephfs_key_action', 'equalto', 'none') | list | length > 0 }}
-  block:
-    - name: Autoriser le cipher aes sur le cluster
-      ansible.builtin.command: ceph mon set auth_allowed_ciphers aes,aes256k
-      delegate_to: "{{ ceph_admin_host }}"
-      run_once: true
-      when: cephfs_need_insecure | bool and 'aes' not in cephfs_allowed_ciphers
+- name: Créer la clé client.{{ cephfs_client_name }} ({{ cephfs_key_type }})
+  ansible.builtin.command: >-
+    ceph auth get-or-create client.{{ cephfs_client_name }}
+    mon '{{ cephfs_caps.mon }}' mds '{{ cephfs_caps.mds }}' osd '{{ cephfs_caps.osd }}'
+    --key_type {{ cephfs_key_type }}
+  delegate_to: "{{ ceph_admin_host }}"
+  when: cephfs_key_action == 'create'
+  no_log: true
 
-    - name: Autoriser temporairement la création de clés aes
-      ansible.builtin.command: ceph config set mon mon_auth_allow_insecure_key true
-      delegate_to: "{{ ceph_admin_host }}"
-      run_once: true
-      when: cephfs_need_insecure | bool
-
-    - name: Créer la clé client.{{ cephfs_client_name }} ({{ cephfs_key_type }})
-      ansible.builtin.command: >-
-        ceph auth get-or-create client.{{ cephfs_client_name }}
-        mon '{{ cephfs_caps.mon }}' mds '{{ cephfs_caps.mds }}' osd '{{ cephfs_caps.osd }}'
-        --key_type {{ cephfs_key_type }}
-      delegate_to: "{{ ceph_admin_host }}"
-      when: cephfs_key_action == 'create'
-      no_log: true
-
-    - name: Convertir la clé en {{ cephfs_key_type }} (rotation)
-      ansible.builtin.command: ceph auth rotate client.{{ cephfs_client_name }} --key_type {{ cephfs_key_type }}
-      delegate_to: "{{ ceph_admin_host }}"
-      when: cephfs_key_action == 'rotate'
-      no_log: true
-  always:
-    - name: Interdire de nouveau la création de clés aes
-      ansible.builtin.command: ceph config set mon mon_auth_allow_insecure_key false
-      delegate_to: "{{ ceph_admin_host }}"
-      run_once: true
-      when: cephfs_need_insecure | bool
+- name: Convertir la clé en {{ cephfs_key_type }} (rotation)
+  ansible.builtin.command: ceph auth rotate client.{{ cephfs_client_name }} --key_type {{ cephfs_key_type }}
+  delegate_to: "{{ ceph_admin_host }}"
+  when: cephfs_key_action == 'rotate'
+  no_log: true
 
 - name: Lire la clé
   ansible.builtin.command: ceph auth get client.{{ cephfs_client_name }} -f json
@@ -286,3 +226,9 @@
 - name: Résultat
   ansible.builtin.debug:
     msg: "client.{{ cephfs_client_name }} ({{ cephfs_key_type }}, noyau {{ ansible_kernel }}) -> {{ cephfs_findmnt.stdout }}"
+
+- name: Rappel à l'administrateur
+  ansible.builtin.debug:
+    msg: "mon_auth_allow_insecure_key est encore à true. Une fois les clés créées : ceph config set mon mon_auth_allow_insecure_key false"
+  run_once: true
+  when: cephfs_insecure_key_allowed
