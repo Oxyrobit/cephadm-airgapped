@@ -1,0 +1,14 @@
+; Extrait de zone BIND : découverte des monitors Ceph par SRV.
+; Les clients cherchent _<mon_dns_srv_name>._tcp.<domaine de recherche de /etc/resolv.conf>
+; (mon_dns_srv_name = ceph-mon par défaut). Un enregistrement par monitor.
+$ORIGIN example.lan.
+ceph1          IN A    192.0.2.11
+ceph2          IN A    192.0.2.12
+ceph3          IN A    192.0.2.13
+; port 6789 (msgr1) : utilisé par mount.ceph ; 3300 (msgr2) : utilisé par les clients userspace
+_ceph-mon._tcp IN SRV  10 60 6789 ceph1.example.lan.
+_ceph-mon._tcp IN SRV  10 60 6789 ceph2.example.lan.
+_ceph-mon._tcp IN SRV  10 60 6789 ceph3.example.lan.
+_ceph-mon._tcp IN SRV  10 60 3300 ceph1.example.lan.
+_ceph-mon._tcp IN SRV  10 60 3300 ceph2.example.lan.
+_ceph-mon._tcp IN SRV  10 60 3300 ceph3.example.lan.

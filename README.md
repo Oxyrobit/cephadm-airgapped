@@ -2,7 +2,7 @@
 
 Déployer Ceph avec **cephadm** sur une machine **sans accès Internet** (air-gap) : la liste
 des images de conteneur à fournir, l'outil pour les copier dans un registre local et la
-configuration podman qui va avec.
+configuration podman qui va avec, plus le déploiement Ansible de clients CephFS.
 
 [![update-images](../../actions/workflows/update-images.yml/badge.svg)](../../actions/workflows/update-images.yml)
 
@@ -81,6 +81,103 @@ cephadm --image quay.io/ceph/ceph:v21.2.0 bootstrap --mon-ip <IP>
 ```
 
 Le bootstrap affiche à la fin l'URL du dashboard, l'utilisateur et le mot de passe.
+
+## Clients CephFS (Ansible, `mount -t ceph`)
+
+Le playbook [`ansible/cephfs-clients.yml`](ansible/cephfs-clients.yml) (rôle `cephfs_client`) prépare des
+clients Debian 11, 12 ou 13 vierges :
+
+1. **Dépendances** : `python3` (bootstrap en `raw`), dépôt `debian-<release>` de Ceph pour bookworm et trixie
+   (`ceph-common` de Debian sinon), `kmod`, module `ceph`. Le proxy apt est optionnel (`apt_proxy`).
+   bullseye, hors support, passe par `archive.debian.org`.
+2. **Clé dédiée par hôte**, générée sur le cluster par `delegate_to: ceph_admin_host` : `client.<hostname>`,
+   droits limités au subvolume.
+   - `mon 'allow r fsname=<fs>'`
+   - `mds 'allow rw fsname=<fs> path=<subvolume>'`
+   - `osd 'allow rw pool=<data> namespace=<ns du subvolume>'`
+
+   La racine du filesystem est refusée (`mount error 13`).
+3. **Type de clé selon le noyau du client** : `aes` si le noyau est antérieur à 7.0, `aes256k` sinon.
+   - Le seuil se règle avec `cephfs_aes256k_min_kernel`.
+   - Une clé existante d'un autre type est convertie par `ceph auth rotate`.
+4. **`/etc/ceph/ceph.conf`** contient seulement le `fsid` et `mon_dns_srv_name` : les monitors sont trouvés
+   par **DNS SRV**. La clé est déposée dans `/etc/ceph/ceph.client.<hostname>.keyring` (0600).
+5. **fstab** : `_netdev,x-systemd.automount`. Le montage se fait **après le réseau, au premier accès**.
+
+```bash
+cd ansible
+cp inventory.example.yml inventory.yml   # adapter : hôtes, apt_proxy, ceph_admin_host
+ansible-galaxy collection install community.general ansible.posix
+ansible-playbook cephfs-clients.yml
+```
+
+| Variable | Défaut | Rôle |
+|---|---|---|
+| `ceph_admin_host` | `ceph1` | hôte de l'inventaire qui possède `client.admin` |
+| `ceph_allow_aes` | `false` | autoriser le cipher `aes` sur le cluster si un client l'exige |
+| `cephfs_name` / `cephfs_subvolume_group` / `cephfs_subvolume` | `ceph-main` / `main` / `nfs` | cible ; créée si absente (`cephfs_subvolume_create`) |
+| `cephfs_mountpoint` | `/mnt/nfs-main` | point de montage |
+| `cephfs_access` | `rw` | `rw` ou `r` |
+| `cephfs_aes256k_min_kernel` | `7.0` | en dessous de ce noyau : clé `aes` |
+| `cephfs_key_type` | calculé | forcer `aes` ou `aes256k` pour un hôte |
+| `cephfs_mon_dns_srv_name` | `ceph-mon` | nom du SRV ; `cephfs_mon_host` désactive le SRV |
+| `cephfs_ms_mode` / `cephfs_mon_addr` | vide | chiffrement sur le fil (voir plus bas) |
+| `ceph_repo_url`, `ceph_repo_key_url`, `apt_proxy` | download.ceph.com, vide | miroirs et proxy |
+
+### Enregistrement SRV
+
+Exemple : [`ansible/dns/ceph-mon.zone.example`](ansible/dns/ceph-mon.zone.example).
+
+```
+_ceph-mon._tcp.example.lan. IN SRV 10 60 6789 ceph1.example.lan.
+```
+
+- Le domaine doit être dans le `search` de `/etc/resolv.conf` du client.
+- Vérification : `dig +short SRV _ceph-mon._tcp.example.lan` puis `ceph --id <hostname> -s`.
+
+### Format du montage
+
+| ceph-common | Source dans fstab |
+|---|---|
+| ≥ 17 (Quincy, Umbrella) | `<hostname>@<fsid>.<fs>=<chemin>` |
+| < 17 (Nautilus, Debian 11) | `:<chemin>` avec `name=<hostname>,mds_namespace=<fs>` |
+
+Dans les deux cas, `mount.ceph` lit les monitors via le SRV et la clé dans le keyring.
+
+### Activer le chiffrement cephx `aes`
+
+Depuis Umbrella, le cluster n'accepte que `aes256k`. Or le client noyau Linux 6.x ne connaît que `aes`
+(AES-128). Avec une clé aes256k, le montage échoue :
+- côté noyau : `libceph: secret too big 32` ;
+- côté mount.ceph : `adding ceph secret key to kernel failed: Invalid argument`.
+
+Avec `ceph_allow_aes: true`, le rôle fait ces étapes lui-même. Sinon, à la main sur le cluster :
+
+```bash
+# 1. accepter aes en plus d'aes256k pour l'authentification
+ceph mon set auth_allowed_ciphers aes,aes256k
+ceph mon dump | grep cipher                     # auth_allowed_ciphers aes, aes256k
+
+# 2. autoriser la création de clés aes le temps de créer ou convertir les clés
+ceph config set mon mon_auth_allow_insecure_key true
+ceph auth get-or-create client.app1 mon 'allow r fsname=ceph-main' \
+  mds 'allow rw fsname=ceph-main path=/volumes/main/nfs/<uuid>' \
+  osd 'allow rw pool=cephfs.ceph-main.data namespace=fsvolumens__main_nfs' --key_type aes
+ceph auth rotate client.app2 --key_type aes      # convertir une clé existante
+ceph config set mon mon_auth_allow_insecure_key false
+
+# 3. contrôle : AUTH_INSECURE_CLIENT_KEY_TYPE et AUTH_INSECURE_KEYS_ALLOWED sont attendus
+ceph health detail
+
+# retour à aes256k seul, quand plus aucun client n'utilise aes
+ceph mon set auth_allowed_ciphers aes256k
+```
+
+**Chiffrement des données sur le réseau** (msgr2 `secure`, AES-GCM) : c'est indépendant du type de clé, et
+une clé `aes` fonctionne aussi. Définissez `cephfs_ms_mode: secure` et `cephfs_mon_addr: ceph1.example.lan:3300`.
+`mount.ceph` ne prend pas d'adresse msgr2 depuis le SRV (`unable to determine mon addresses`), d'où
+`mon_addr`. Pour l'imposer côté cluster :
+`ceph config set global ms_client_mode secure`, `ms_service_mode secure`, `ms_mon_client_mode secure`.
 
 ## Comment les versions sont déterminées
 

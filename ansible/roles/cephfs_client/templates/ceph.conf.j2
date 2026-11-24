@@ -1,0 +1,9 @@
+# {{ ansible_managed }}
+[global]
+	fsid = {{ cephfs_fsid }}
+{% if cephfs_mon_host %}
+	mon_host = {{ cephfs_mon_host }}
+{% else %}
+	# monitors découverts par DNS : SRV _{{ cephfs_mon_dns_srv_name }}._tcp.<domaine de recherche>
+	mon_dns_srv_name = {{ cephfs_mon_dns_srv_name }}
+{% endif %}

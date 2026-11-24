@@ -1,0 +1,288 @@
+---
+- name: Vérifier la plateforme
+  ansible.builtin.assert:
+    that:
+      - ansible_distribution == 'Debian'
+      - cephfs_key_type in ['aes', 'aes256k']
+      - not cephfs_ms_mode or cephfs_mon_addr
+    fail_msg: "Debian uniquement ; cephfs_ms_mode exige cephfs_mon_addr (le helper ne lit pas d'adresse msgr2 depuis le SRV)."
+
+# ------------------------------------------------------------------------------------
+# 1. Dépendances (miroirs Debian / Ceph, via proxy éventuel)
+# ------------------------------------------------------------------------------------
+- name: Proxy apt
+  ansible.builtin.copy:
+    dest: /etc/apt/apt.conf.d/90proxy
+    content: 'Acquire::http::Proxy "{{ apt_proxy }}";'
+    mode: "0644"
+  when: apt_proxy | length > 0
+
+- name: Release hors support -> archive.debian.org
+  ansible.builtin.copy:
+    dest: /etc/apt/sources.list
+    content: |
+      deb http://archive.debian.org/debian {{ ansible_distribution_release }} main
+      deb http://archive.debian.org/debian-security {{ ansible_distribution_release }}-security main
+    mode: "0644"
+  when: ansible_distribution_release in debian_archive_releases
+
+- name: Dépôt Ceph ({{ ceph_release }})
+  when: ansible_distribution_release in ceph_repo_codenames
+  block:
+    - name: Clé de signature Ceph
+      ansible.builtin.get_url:
+        url: "{{ ceph_repo_key_url }}"
+        dest: /etc/apt/keyrings/ceph.asc
+        mode: "0644"
+      register: cephfs_repo_key
+      environment: "{{ {'http_proxy': apt_proxy, 'https_proxy': apt_proxy} if apt_proxy else {} }}"
+
+    - name: Source apt Ceph
+      ansible.builtin.copy:
+        dest: /etc/apt/sources.list.d/ceph.sources
+        mode: "0644"
+        content: |
+          Types: deb
+          URIs: {{ ceph_repo_url }}
+          Suites: {{ ansible_distribution_release }}
+          Components: main
+          Signed-By: /etc/apt/keyrings/ceph.asc
+      register: cephfs_repo_src
+
+# dépôt ajouté/modifié : relire le cache et passer à la version Ceph du dépôt (sinon apt garde celle de Debian)
+- name: Paquets (ceph-common fournit mount.ceph)
+  ansible.builtin.apt:
+    name: [ceph-common, kmod]
+    state: "{{ 'latest' if (cephfs_repo_src is changed or cephfs_repo_key is changed) else 'present' }}"
+    install_recommends: false
+    update_cache: true
+    cache_valid_time: "{{ 0 if (cephfs_repo_src is changed or cephfs_repo_key is changed) else 3600 }}"
+
+- name: Version de ceph-common
+  ansible.builtin.command: ceph --version
+  register: cephfs_ceph_version
+  changed_when: false
+
+- name: Module noyau ceph
+  community.general.modprobe:
+    name: ceph
+    persistent: present
+
+# ------------------------------------------------------------------------------------
+# 2. Côté cluster (delegate_to) : subvolume, clé dédiée, caps
+# ------------------------------------------------------------------------------------
+- name: Subvolume (une seule fois)
+  delegate_to: "{{ ceph_admin_host }}"
+  run_once: true
+  block:
+    - name: Lire le fsid
+      ansible.builtin.command: ceph fsid
+      register: cephfs_fsid_cmd
+      changed_when: false
+
+    - name: Chemin du subvolume
+      ansible.builtin.command: >-
+        ceph fs subvolume getpath {{ cephfs_name }} {{ cephfs_subvolume }} --group_name {{ cephfs_subvolume_group }}
+      register: cephfs_getpath
+      changed_when: false
+      failed_when: false
+
+    - name: Créer groupe et subvolume
+      when: cephfs_getpath.rc != 0 and cephfs_subvolume_create
+      ansible.builtin.shell: |
+        set -e
+        ceph fs subvolumegroup create {{ cephfs_name }} {{ cephfs_subvolume_group }}
+        ceph fs subvolume create {{ cephfs_name }} {{ cephfs_subvolume }} --group_name {{ cephfs_subvolume_group }} \
+          --namespace-isolated --mode {{ cephfs_subvolume_mode }}
+
+    - name: Infos du subvolume
+      ansible.builtin.command: >-
+        ceph fs subvolume info {{ cephfs_name }} {{ cephfs_subvolume }} --group_name {{ cephfs_subvolume_group }} -f json
+      register: cephfs_subvol_info
+      changed_when: false
+
+    - name: Monmap (ciphers autorisés)
+      ansible.builtin.command: ceph mon dump -f json
+      register: cephfs_monmap
+      changed_when: false
+
+- name: Faits du subvolume
+  ansible.builtin.set_fact:
+    cephfs_fsid: "{{ cephfs_fsid_cmd.stdout | trim }}"
+    cephfs_path: "{{ (cephfs_subvol_info.stdout | from_json).path }}"
+    cephfs_caps:
+      mon: "allow r fsname={{ cephfs_name }}"
+      mds: "allow {{ cephfs_access }} fsname={{ cephfs_name }} path={{ (cephfs_subvol_info.stdout | from_json).path }}"
+      osd: >-
+        {%- set i = cephfs_subvol_info.stdout | from_json -%}
+        {%- if i.pool_namespace -%}
+        allow {{ cephfs_access }} pool={{ i.data_pool }} namespace={{ i.pool_namespace }}
+        {%- else -%}
+        allow {{ cephfs_access }} tag cephfs data={{ cephfs_name }}
+        {%- endif -%}
+    cephfs_allowed_ciphers: "{{ (cephfs_monmap.stdout | from_json).auth_allowed_ciphers | map(attribute='name') | list }}"
+
+- name: Clé existante
+  ansible.builtin.command: ceph auth get client.{{ cephfs_client_name }} -f json
+  delegate_to: "{{ ceph_admin_host }}"
+  register: cephfs_auth_get
+  changed_when: false
+  failed_when: cephfs_auth_get.rc not in [0, 2]
+
+# Le type est encodé dans les 2 premiers octets de la clé : 1 = aes ("AQ..."), 2 = aes256k ("Ag...").
+- name: Action à mener sur la clé
+  ansible.builtin.set_fact:
+    cephfs_key_type_fact: "{{ cephfs_key_type }}"    # fait d'hôte, lisible via hostvars
+    cephfs_key_action: >-
+      {%- if cephfs_auth_get.rc != 0 -%}create
+      {%- elif ((cephfs_auth_get.stdout | from_json)[0].key[:2] == 'AQ') != (cephfs_key_type == 'aes') -%}rotate
+      {%- else -%}none{%- endif -%}
+
+- name: Le cluster doit accepter le cipher aes
+  ansible.builtin.assert:
+    that: "'aes' in cephfs_allowed_ciphers or ceph_allow_aes | bool"
+    fail_msg: >-
+      {{ inventory_hostname }} (noyau {{ ansible_kernel }}) exige une clé "aes" mais le cluster n'autorise que
+      {{ cephfs_allowed_ciphers }}. Passez ceph_allow_aes=true ou lancez sur le cluster :
+      ceph mon set auth_allowed_ciphers aes,aes256k
+  when: cephfs_key_type == 'aes'
+
+- name: Créer / convertir les clés
+  vars:
+    cephfs_need_insecure: >-
+      {{ ansible_play_hosts | map('extract', hostvars)
+         | selectattr('cephfs_key_type_fact', 'equalto', 'aes')
+         | rejectattr('cephfs_key_action', 'equalto', 'none') | list | length > 0 }}
+  block:
+    - name: Autoriser le cipher aes sur le cluster
+      ansible.builtin.command: ceph mon set auth_allowed_ciphers aes,aes256k
+      delegate_to: "{{ ceph_admin_host }}"
+      run_once: true
+      when: cephfs_need_insecure | bool and 'aes' not in cephfs_allowed_ciphers
+
+    - name: Autoriser temporairement la création de clés aes
+      ansible.builtin.command: ceph config set mon mon_auth_allow_insecure_key true
+      delegate_to: "{{ ceph_admin_host }}"
+      run_once: true
+      when: cephfs_need_insecure | bool
+
+    - name: Créer la clé client.{{ cephfs_client_name }} ({{ cephfs_key_type }})
+      ansible.builtin.command: >-
+        ceph auth get-or-create client.{{ cephfs_client_name }}
+        mon '{{ cephfs_caps.mon }}' mds '{{ cephfs_caps.mds }}' osd '{{ cephfs_caps.osd }}'
+        --key_type {{ cephfs_key_type }}
+      delegate_to: "{{ ceph_admin_host }}"
+      when: cephfs_key_action == 'create'
+      no_log: true
+
+    - name: Convertir la clé en {{ cephfs_key_type }} (rotation)
+      ansible.builtin.command: ceph auth rotate client.{{ cephfs_client_name }} --key_type {{ cephfs_key_type }}
+      delegate_to: "{{ ceph_admin_host }}"
+      when: cephfs_key_action == 'rotate'
+      no_log: true
+  always:
+    - name: Interdire de nouveau la création de clés aes
+      ansible.builtin.command: ceph config set mon mon_auth_allow_insecure_key false
+      delegate_to: "{{ ceph_admin_host }}"
+      run_once: true
+      when: cephfs_need_insecure | bool
+
+- name: Lire la clé
+  ansible.builtin.command: ceph auth get client.{{ cephfs_client_name }} -f json
+  delegate_to: "{{ ceph_admin_host }}"
+  register: cephfs_auth_json
+  changed_when: false
+  no_log: true
+
+- name: Mémoriser la clé
+  ansible.builtin.set_fact:
+    cephfs_auth: "{{ (cephfs_auth_json.stdout | from_json)[0] }}"
+  no_log: true
+
+- name: Caps limitées au subvolume
+  ansible.builtin.command: >-
+    ceph auth caps client.{{ cephfs_client_name }}
+    mon '{{ cephfs_caps.mon }}' mds '{{ cephfs_caps.mds }}' osd '{{ cephfs_caps.osd }}'
+  delegate_to: "{{ ceph_admin_host }}"
+  when: cephfs_auth.caps != cephfs_caps
+
+# ------------------------------------------------------------------------------------
+# 3. Côté client : ceph.conf, keyring, fstab (après le réseau, au premier accès)
+# ------------------------------------------------------------------------------------
+- name: Répertoire /etc/ceph
+  ansible.builtin.file:
+    path: /etc/ceph
+    state: directory
+    mode: "0755"
+
+- name: ceph.conf (fsid + découverte SRV)
+  ansible.builtin.template:
+    src: ceph.conf.j2
+    dest: /etc/ceph/ceph.conf
+    mode: "0644"
+  notify: Recharger le montage CephFS
+
+- name: Keyring /etc/ceph/ceph.client.{{ cephfs_client_name }}.keyring
+  ansible.builtin.template:
+    src: keyring.j2
+    dest: /etc/ceph/ceph.client.{{ cephfs_client_name }}.keyring
+    mode: "0600"
+  no_log: true
+  notify: Recharger le montage CephFS
+
+- name: Unité systemd du point de montage
+  ansible.builtin.command: systemd-escape -p {{ cephfs_mountpoint }}
+  register: cephfs_unit_cmd
+  changed_when: false
+
+# mount.ceph >= 17 (quincy) : nom@fsid.fs=/chemin ; plus ancien : :/chemin + name=,mds_namespace=
+- name: Source et options du montage
+  ansible.builtin.set_fact:
+    cephfs_unit: "{{ cephfs_unit_cmd.stdout }}"
+    cephfs_new_syntax: "{{ (cephfs_ceph_version.stdout.split()[2].split('.')[0] | int) >= 17 }}"
+    cephfs_fstab_opts: >-
+      {{ ([cephfs_mount_options]
+          + ([] if (cephfs_ceph_version.stdout.split()[2].split('.')[0] | int) >= 17
+                else ['name=' ~ cephfs_client_name, 'mds_namespace=' ~ cephfs_name])
+          + (['ms_mode=' ~ cephfs_ms_mode] if cephfs_ms_mode else [])
+          + (['mon_addr=' ~ cephfs_mon_addr] if cephfs_mon_addr else [])) | join(',') }}
+
+# sans "mode" : ne modifie jamais un répertoire existant (une fois monté, c'est la racine du subvolume)
+- name: Point de montage
+  ansible.builtin.file:
+    path: "{{ cephfs_mountpoint }}"
+    state: directory
+
+- name: Entrée fstab
+  ansible.posix.mount:
+    path: "{{ cephfs_mountpoint }}"
+    src: >-
+      {{ (cephfs_client_name ~ '@' ~ cephfs_fsid ~ '.' ~ cephfs_name ~ '=' ~ cephfs_path)
+         if cephfs_new_syntax else (':' ~ cephfs_path) }}
+    fstype: ceph
+    opts: "{{ cephfs_fstab_opts }}"
+    state: present
+  notify: Recharger le montage CephFS
+
+- name: Activer l'automount
+  ansible.builtin.systemd:
+    name: "{{ cephfs_unit }}.automount"
+    state: started
+    daemon_reload: true
+
+- name: Appliquer les changements avant le test
+  ansible.builtin.meta: flush_handlers
+
+- name: Premier accès (déclenche le montage)
+  ansible.builtin.command: findmnt -n -t ceph -o SOURCE,OPTIONS {{ cephfs_mountpoint }}
+  args:
+    chdir: "{{ cephfs_mountpoint }}"     # l'accès au répertoire déclenche l'automount
+  register: cephfs_findmnt
+  changed_when: false
+  retries: 3
+  delay: 5
+  until: cephfs_findmnt.rc == 0
+
+- name: Résultat
+  ansible.builtin.debug:
+    msg: "client.{{ cephfs_client_name }} ({{ cephfs_key_type }}, noyau {{ ansible_kernel }}) -> {{ cephfs_findmnt.stdout }}"

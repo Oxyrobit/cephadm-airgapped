@@ -1,0 +1,30 @@
+# Déploie des clients CephFS (mount -t ceph) avec une clé cephx dédiée par hôte.
+#   ansible-playbook cephfs-clients.yml [-l app1]
+- name: Bootstrap python3 (machine Debian vierge, éventuellement air-gap)
+  hosts: cephfs_clients
+  gather_facts: false
+  tasks:
+    - name: Installer python3 et python3-apt via apt (proxy éventuel)
+      ansible.builtin.raw: |
+        set -e
+        if command -v python3 >/dev/null && python3 -c 'import apt' 2>/dev/null; then echo OK; exit 0; fi
+        if [ -n "{{ apt_proxy | default('') }}" ]; then
+          echo 'Acquire::http::Proxy "{{ apt_proxy }}";' > /etc/apt/apt.conf.d/90proxy
+        fi
+        . /etc/os-release
+        case " {{ debian_archive_releases | default(['bullseye']) | join(' ') }} " in
+          *" $VERSION_CODENAME "*)
+            printf 'deb http://archive.debian.org/debian %s main\ndeb http://archive.debian.org/debian-security %s-security main\n' \
+              "$VERSION_CODENAME" "$VERSION_CODENAME" > /etc/apt/sources.list
+            rm -f /etc/apt/sources.list.d/debian.sources ;;
+        esac
+        apt-get update -q >/dev/null
+        DEBIAN_FRONTEND=noninteractive apt-get install -yq --no-install-recommends python3 python3-apt >/dev/null
+        echo CHANGED
+      register: bootstrap
+      changed_when: "'CHANGED' in bootstrap.stdout"
+
+- name: Clients CephFS
+  hosts: cephfs_clients
+  roles:
+    - cephfs_client

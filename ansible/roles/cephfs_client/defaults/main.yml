@@ -1,0 +1,35 @@
+# --- Accès aux paquets ---------------------------------------------------------------
+apt_proxy: ""                                   # proxy HTTP pour apt/get_url (vide = aucun)
+debian_archive_releases: [bullseye]             # releases hors support -> archive.debian.org
+ceph_release: umbrella
+ceph_repo_url: "http://download.ceph.com/debian-{{ ceph_release }}"   # ou miroir local
+ceph_repo_key_url: "http://download.ceph.com/keys/release.asc"
+ceph_repo_codenames: [bookworm, trixie]         # codenames publiés ; sinon ceph-common de Debian
+
+# --- Cluster (délégation) ------------------------------------------------------------
+ceph_admin_host: ceph1                          # hôte inventaire avec client.admin
+ceph_allow_aes: false                           # autoriser le cipher cephx "aes" si un client l'exige
+
+# --- Filesystem ----------------------------------------------------------------------
+cephfs_name: ceph-main
+cephfs_subvolume_group: main
+cephfs_subvolume: nfs
+cephfs_subvolume_create: true                   # crée groupe + subvolume s'ils manquent
+cephfs_subvolume_mode: "0775"
+cephfs_access: rw                               # rw | r
+
+# --- Client ---------------------------------------------------------------------------
+cephfs_client_name: "{{ ansible_hostname }}"    # -> client.<nom>, /etc/ceph/ceph.client.<nom>.keyring
+cephfs_mountpoint: /mnt/nfs-main
+# Le client noyau n'accepte que des clés "aes" (AES-128) sous ce seuil de version.
+cephfs_aes256k_min_kernel: "7.0"
+cephfs_key_type: "{{ 'aes' if (ansible_kernel.split('-')[0] is version(cephfs_aes256k_min_kernel, '<')) else 'aes256k' }}"
+
+# Découverte des monitors : enregistrement DNS SRV _<srv_name>._tcp.<domaine de recherche>
+cephfs_mon_dns_srv_name: ceph-mon
+cephfs_mon_host: ""                             # optionnel : forcer mon_host (désactive le SRV)
+
+# Montage : après le réseau (_netdev), au premier accès (automount)
+cephfs_mount_options: "noatime,_netdev,x-systemd.automount,x-systemd.mount-timeout=30"
+cephfs_ms_mode: ""                              # ex. "secure" (AES-GCM sur le fil, exige cephfs_mon_addr)
+cephfs_mon_addr: ""                             # ex. "ceph1.example.lan:3300" (requis avec ms_mode)

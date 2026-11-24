@@ -1,0 +1,15 @@
+# Copier en inventory.yml et adapter.
+all:
+  vars:
+    apt_proxy: ""                    # ex. http://proxy.example.lan:3128 (vide = accès direct au miroir)
+    ceph_admin_host: ceph1           # hôte qui possède client.admin (delegate_to)
+    ceph_allow_aes: false            # true = autorise le chiffrement cephx "aes" sur le cluster si un client en a besoin
+  children:
+    ceph_admin:
+      hosts:
+        ceph1: {ansible_host: ceph1.example.lan, ansible_user: root}
+    cephfs_clients:
+      vars: {ansible_user: root}
+      hosts:
+        app1: {ansible_host: app1.example.lan}
+        app2: {ansible_host: app2.example.lan}

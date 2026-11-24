@@ -1,0 +1,5 @@
+- name: Recharger le montage CephFS
+  ansible.builtin.shell: |
+    systemctl daemon-reload
+    systemctl stop '{{ cephfs_unit }}.mount' 2>/dev/null || umount -l '{{ cephfs_mountpoint }}' 2>/dev/null || true
+    systemctl restart '{{ cephfs_unit }}.automount'
