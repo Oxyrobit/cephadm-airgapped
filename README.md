@@ -84,7 +84,7 @@ Le bootstrap affiche à la fin l'URL du dashboard, l'utilisateur et le mot de pa
 
 ## Clients CephFS (Ansible, `mount -t ceph`)
 
-Le playbook [`ansible/cephfs-clients.yml`](ansible/cephfs-clients.yml) (rôle `cephfs_client`) prépare des
+Le playbook [`deploiement-client/cephfs-clients.yml`](deploiement-client/cephfs-clients.yml) (rôle `cephfs_client`) prépare des
 clients Debian 11, 12 ou 13 vierges :
 
 **Prérequis** sur les clients : `python3`, et des dépôts Debian et Ceph (`debian-<release>`) déjà configurés
@@ -109,7 +109,7 @@ et joignables. Le rôle ne touche ni aux sources apt ni au proxy.
 5. **fstab** : `_netdev,x-systemd.automount`. Le montage se fait **après le réseau, au premier accès**.
 
 ```bash
-cd ansible
+cd deploiement-client
 cp inventory.example.yml inventory.yml   # adapter : hôtes, apt_proxy, ceph_admin_host
 ansible-galaxy collection install ansible.posix
 ansible-playbook cephfs-clients.yml
@@ -128,7 +128,7 @@ ansible-playbook cephfs-clients.yml
 
 ### Enregistrement SRV
 
-Exemple : [`ansible/dns/ceph-mon.zone.example`](ansible/dns/ceph-mon.zone.example).
+Exemple : [`deploiement-client/dns/ceph-mon.zone.example`](deploiement-client/dns/ceph-mon.zone.example).
 
 ```
 _ceph-mon._tcp.example.lan. IN SRV 10 60 6789 ceph1.example.lan.
